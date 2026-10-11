@@ -4074,6 +4074,40 @@ async fn test_autoscroll_horizontally_long_selection_tracks_cursor(cx: &mut Test
 }
 
 #[gpui::test]
+fn test_provisional_autoscroll_is_dropped_when_a_shared_scroll_anchor_moves(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    let buffer = cx.update(|cx| MultiBuffer::build_simple(&"line\n".repeat(100), cx));
+    let editor = cx.add_window(|window, cx| build_editor(buffer, window, cx));
+    let retain_and_take = |cx: &mut TestAppContext, move_shared_anchor: bool| {
+        editor
+            .update(cx, |editor, _, cx| {
+                let selections = crate::scroll::SelectionsState::new(editor);
+                editor.scroll_manager.retain_provisional_autoscroll(
+                    (Autoscroll::fit(), true),
+                    selections,
+                    cx,
+                );
+                if move_shared_anchor {
+                    editor
+                        .scroll_manager
+                        .scroll_anchor_entity()
+                        .update(cx, |shared, _| shared.scroll_anchor.offset.x += 5.);
+                }
+                let selections = crate::scroll::SelectionsState::new(editor);
+                editor
+                    .scroll_manager
+                    .take_provisional_autoscroll(&selections, cx)
+            })
+            .unwrap()
+    };
+
+    assert_eq!(retain_and_take(cx, false), Some((Autoscroll::fit(), true)));
+    assert_eq!(retain_and_take(cx, true), None);
+}
+
+#[gpui::test]
 async fn test_autoscroll_horizontally_survives_first_inlay_measurement(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
     let mut cx = EditorTestContext::new(cx).await;

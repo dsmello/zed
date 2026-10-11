@@ -473,7 +473,6 @@ fn editor_render_unwrapped_long_lines(script: &&str, cx: &mut BenchAppContext) {
 #[gpui::bench(
     inputs = [
         "type",
-        "backspace",
         "left_right",
         "up_down",
         "home_end",
@@ -565,13 +564,7 @@ fn editor_edit_huge_unwrapped_line(operation: &&str, cx: &mut BenchAppContext) {
                     editor.backspace(&Default::default(), window, cx);
                 }
             }
-            "backspace" => {
-                if toggle {
-                    editor.backspace(&Default::default(), window, cx);
-                } else {
-                    editor.handle_input(" ", window, cx);
-                }
-            }
+
             "left_right" => {
                 if toggle {
                     editor.move_left(&Default::default(), window, cx);

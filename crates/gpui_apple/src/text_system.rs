@@ -4,7 +4,6 @@ use core_foundation::{
     array::{CFArray, CFArrayRef},
     attributed_string::CFMutableAttributedString,
     base::{CFRange, TCFType},
-    data::CFData,
     number::CFNumber,
     string::CFString,
 };
@@ -211,7 +210,69 @@ impl PlatformTextSystem for AppleTextSystem {
     }
 
     fn layout_line(&self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
-        self.0.write().layout_line(text, font_size, font_runs)
+        let fonts = {
+            let lock = self.0.read();
+            font_runs
+                .iter()
+                .map(|run| {
+                    let font = &lock.fonts[run.font_id.0];
+                    (run.len, font.native_font(), font.metrics())
+                })
+                .collect::<SmallVec<[_; 4]>>()
+        };
+        let shaped = shape_line(text, font_size, &fonts);
+        let font_ids = {
+            let lock = self.0.upgradable_read();
+            let known = shaped
+                .runs
+                .iter()
+                .map(|run| {
+                    lock.font_ids_by_postscript_name
+                        .get(&run.font.postscript_name())
+                        .copied()
+                })
+                .collect::<Option<SmallVec<[_; 4]>>>();
+            match known {
+                Some(font_ids) => font_ids,
+                None => {
+                    let mut lock = RwLockUpgradableReadGuard::upgrade(lock);
+                    shaped
+                        .runs
+                        .iter()
+                        .map(|run| lock.id_for_native_font(run.font.clone()))
+                        .collect()
+                }
+            }
+        };
+        let lock = self.0.read();
+        let mut runs = Vec::<ShapedRun>::with_capacity(shaped.runs.len());
+        for (run, font_id) in shaped.runs.into_iter().zip(font_ids) {
+            let is_emoji = lock.is_emoji(font_id);
+            let glyphs = run
+                .glyphs
+                .into_iter()
+                .map(|(id, position, index)| ShapedGlyph {
+                    id,
+                    position,
+                    index,
+                    is_emoji,
+                });
+            match runs.last_mut() {
+                Some(last) if last.font_id == font_id => last.glyphs.extend(glyphs),
+                _ => runs.push(ShapedRun {
+                    font_id,
+                    glyphs: glyphs.collect(),
+                }),
+            }
+        }
+        LineLayout {
+            runs,
+            font_size,
+            width: shaped.width,
+            ascent: shaped.ascent,
+            descent: shaped.descent,
+            len: text.len(),
+        }
     }
 
     fn recommended_rendering_mode(
@@ -234,53 +295,6 @@ impl PlatformTextSystem for AppleTextSystem {
         let luminance = 0.2126 * rgba.r + 0.7152 * rgba.g + 0.0722 * rgba.b;
         let level = ((4.0 * luminance) + 0.5).floor() as i32;
         level.clamp(0, 4) as u8
-    }
-
-    fn ascii_shaping_preserves_advances(&self, font_id: FontId, features: &FontFeatures) -> bool {
-        let lock = self.0.read();
-        let Some(font) = lock.fonts.get(font_id.0) else {
-            return false;
-        };
-        let native = font.native_font();
-        let table = |tag: &[u8; 4]| native.get_font_table(u32::from_be_bytes(*tag));
-        let (Some(head), Some(hhea), Some(maxp)) = (table(b"head"), table(b"hhea"), table(b"maxp"))
-        else {
-            return false;
-        };
-        let (hmtx, gsub, gpos, morx, kern, kerx) = (
-            table(b"hmtx"),
-            table(b"GSUB"),
-            table(b"GPOS"),
-            table(b"morx"),
-            table(b"kern"),
-            table(b"kerx"),
-        );
-        let Some(ascii_glyphs) = (0x20u8..=0x7E)
-            .map(|byte| font.glyph_for_char(byte as char).map(|glyph| glyph as u16))
-            .collect::<Option<Vec<_>>>()
-        else {
-            return false;
-        };
-        gpui::ascii_shaping_preserves_advances(
-            gpui::ShapingTables {
-                head: head.bytes(),
-                hhea: hhea.bytes(),
-                maxp: maxp.bytes(),
-                hmtx: hmtx.as_ref().map(CFData::bytes),
-                gsub: gsub.as_ref().map(CFData::bytes),
-                gpos: gpos.as_ref().map(CFData::bytes),
-                morx: morx.as_ref().map(CFData::bytes),
-                kern: kern.as_ref().map(CFData::bytes),
-                kerx: kerx.as_ref().map(CFData::bytes),
-            },
-            &ascii_glyphs,
-            features.tag_value_list(),
-            |glyph| {
-                font.advance(u32::from(glyph))
-                    .ok()
-                    .map(|advance| advance.x())
-            },
-        )
     }
 }
 
@@ -584,103 +598,104 @@ impl AppleTextSystemState {
             Ok((bitmap_size, bytes))
         }
     }
+}
 
-    fn layout_line(&mut self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
-        // Construct the attributed string, converting UTF8 ranges to UTF16 ranges.
-        let mut string = CFMutableAttributedString::new();
-        let mut max_ascent = 0.0f32;
-        let mut max_descent = 0.0f32;
+struct ShapedNativeLine {
+    runs: Vec<ShapedNativeRun>,
+    width: Pixels,
+    ascent: Pixels,
+    descent: Pixels,
+}
 
+struct ShapedNativeRun {
+    font: CTFont,
+    glyphs: Vec<(GlyphId, gpui::Point<Pixels>, usize)>,
+}
+
+fn shape_line(
+    text: &str,
+    font_size: Pixels,
+    fonts: &[(usize, CTFont, Metrics)],
+) -> ShapedNativeLine {
+    // Construct the attributed string, converting UTF8 ranges to UTF16 ranges.
+    let mut string = CFMutableAttributedString::new();
+    let mut max_ascent = 0.0f32;
+    let mut max_descent = 0.0f32;
+
+    {
+        let mut text = text;
+        let mut break_ligature = true;
+        for (len, native_font, font_metrics) in fonts {
+            let text_run;
+            (text_run, text) = text.split_at(*len);
+
+            let utf16_start = string.char_len(); // insert at end of string
+            // note: replace_str may silently ignore codepoints it dislikes (e.g., BOM at start of string)
+            string.replace_str(&CFString::new(text_run), CFRange::init(utf16_start, 0));
+            let utf16_end = string.char_len();
+
+            let length = utf16_end - utf16_start;
+            let cf_range = CFRange::init(utf16_start, length);
+
+            let font_scale = f32::from(font_size) / font_metrics.units_per_em as f32;
+            max_ascent = max_ascent.max(font_metrics.ascent * font_scale);
+            max_descent = max_descent.max(-font_metrics.descent * font_scale);
+
+            let font_size = if break_ligature {
+                px(f32::from(font_size).next_up())
+            } else {
+                font_size
+            };
+            unsafe {
+                string.set_attribute(
+                    cf_range,
+                    kCTFontAttributeName,
+                    &native_font.clone_with_font_size(font_size.into()),
+                );
+            }
+            break_ligature = !break_ligature;
+        }
+    }
+    // Retrieve the glyphs from the shaped line, converting UTF16 offsets to UTF8 offsets.
+    let line = CTLine::new_with_attributed_string(string.as_concrete_TypeRef());
+    let glyph_runs = line.glyph_runs();
+    let mut runs = Vec::<ShapedNativeRun>::with_capacity(glyph_runs.len() as usize);
+    let mut ix_converter = StringIndexConverter::new(text);
+    for run in glyph_runs.into_iter() {
+        let attributes = run.attributes().unwrap();
+        let font = unsafe {
+            attributes
+                .get(kCTFontAttributeName)
+                .downcast::<CTFont>()
+                .unwrap()
+        };
+        let mut glyphs = Vec::with_capacity(run.glyph_count().try_into().unwrap_or(0));
+        for ((&glyph_id, position), &glyph_utf16_ix) in run
+            .glyphs()
+            .iter()
+            .zip(run.positions().iter())
+            .zip(run.string_indices().iter())
         {
-            let mut text = text;
-            let mut break_ligature = true;
-            for run in font_runs {
-                let text_run;
-                (text_run, text) = text.split_at(run.len);
-
-                let utf16_start = string.char_len(); // insert at end of string
-                // note: replace_str may silently ignore codepoints it dislikes (e.g., BOM at start of string)
-                string.replace_str(&CFString::new(text_run), CFRange::init(utf16_start, 0));
-                let utf16_end = string.char_len();
-
-                let length = utf16_end - utf16_start;
-                let cf_range = CFRange::init(utf16_start, length);
-                let font = &self.fonts[run.font_id.0];
-
-                let font_metrics = font.metrics();
-                let font_scale = f32::from(font_size) / font_metrics.units_per_em as f32;
-                max_ascent = max_ascent.max(font_metrics.ascent * font_scale);
-                max_descent = max_descent.max(-font_metrics.descent * font_scale);
-
-                let font_size = if break_ligature {
-                    px(f32::from(font_size).next_up())
-                } else {
-                    font_size
-                };
-                unsafe {
-                    string.set_attribute(
-                        cf_range,
-                        kCTFontAttributeName,
-                        &font.native_font().clone_with_font_size(font_size.into()),
-                    );
-                }
-                break_ligature = !break_ligature;
+            let glyph_utf16_ix = usize::try_from(glyph_utf16_ix).unwrap();
+            if ix_converter.utf16_ix > glyph_utf16_ix {
+                // We cannot reuse current index converter, as it can only seek forward. Restart the search.
+                ix_converter = StringIndexConverter::new(text);
             }
+            ix_converter.advance_to_utf16_ix(glyph_utf16_ix);
+            glyphs.push((
+                GlyphId(glyph_id as u32),
+                point(position.x as f32, position.y as f32).map(px),
+                ix_converter.utf8_ix,
+            ));
         }
-        // Retrieve the glyphs from the shaped line, converting UTF16 offsets to UTF8 offsets.
-        let line = CTLine::new_with_attributed_string(string.as_concrete_TypeRef());
-        let glyph_runs = line.glyph_runs();
-        let mut runs = <Vec<ShapedRun>>::with_capacity(glyph_runs.len() as usize);
-        let mut ix_converter = StringIndexConverter::new(text);
-        for run in glyph_runs.into_iter() {
-            let attributes = run.attributes().unwrap();
-            let font = unsafe {
-                attributes
-                    .get(kCTFontAttributeName)
-                    .downcast::<CTFont>()
-                    .unwrap()
-            };
-            let font_id = self.id_for_native_font(font);
-
-            let glyphs = match runs.last_mut() {
-                Some(run) if run.font_id == font_id => &mut run.glyphs,
-                _ => {
-                    runs.push(ShapedRun {
-                        font_id,
-                        glyphs: Vec::with_capacity(run.glyph_count().try_into().unwrap_or(0)),
-                    });
-                    &mut runs.last_mut().unwrap().glyphs
-                }
-            };
-            for ((&glyph_id, position), &glyph_utf16_ix) in run
-                .glyphs()
-                .iter()
-                .zip(run.positions().iter())
-                .zip(run.string_indices().iter())
-            {
-                let glyph_utf16_ix = usize::try_from(glyph_utf16_ix).unwrap();
-                if ix_converter.utf16_ix > glyph_utf16_ix {
-                    // We cannot reuse current index converter, as it can only seek forward. Restart the search.
-                    ix_converter = StringIndexConverter::new(text);
-                }
-                ix_converter.advance_to_utf16_ix(glyph_utf16_ix);
-                glyphs.push(ShapedGlyph {
-                    id: GlyphId(glyph_id as u32),
-                    position: point(position.x as f32, position.y as f32).map(px),
-                    index: ix_converter.utf8_ix,
-                    is_emoji: self.is_emoji(font_id),
-                });
-            }
-        }
-        let typographic_bounds = line.get_typographic_bounds();
-        LineLayout {
-            runs,
-            font_size,
-            width: typographic_bounds.width.into(),
-            ascent: max_ascent.into(),
-            descent: max_descent.into(),
-            len: text.len(),
-        }
+        runs.push(ShapedNativeRun { font, glyphs });
+    }
+    let typographic_bounds = line.get_typographic_bounds();
+    ShapedNativeLine {
+        runs,
+        width: typographic_bounds.width.into(),
+        ascent: max_ascent.into(),
+        descent: max_descent.into(),
     }
 }
 
@@ -824,8 +839,8 @@ mod lenient_font_attributes {
 mod tests {
     use crate::AppleTextSystem;
     use gpui::{
-        Font, FontFallbacks, FontFeatures, FontId, FontRun, GlyphId, LineLayout,
-        PlatformTextSystem, font, px,
+        FontFallbacks, FontFeatures, FontId, FontRun, GlyphId, LineLayout, PlatformTextSystem,
+        font, px,
     };
     use std::sync::Arc;
 
@@ -983,61 +998,6 @@ mod tests {
         let layout = fonts.layout_line(text, px(16.), font_runs);
         assert_eq!(layout.len, 0);
         assert!(layout.runs.is_empty());
-    }
-
-    #[test]
-    fn test_ascii_shaping_preserves_advances() {
-        let fonts = AppleTextSystem::new();
-        fonts
-            .add_fonts(vec![
-                include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf")
-                    .as_slice()
-                    .into(),
-            ])
-            .unwrap();
-        let probes = [
-            "1/2 fi ffi fl != -> === <= >= :: <!-- --> www AV To ".repeat(64),
-            (0x20u8..=0x7E).map(char::from).collect::<String>(),
-        ];
-        for (family, features, expected) in [
-            ("Lilex", &[][..], true),
-            ("Lilex", &[("calt", 0)][..], true),
-            ("Lilex", &[("frac", 1)][..], false),
-            ("Menlo", &[][..], true),
-            ("Menlo", &[("liga", 0)][..], true),
-            ("Menlo", &[("liga", 1)][..], false),
-            ("Times", &[][..], false),
-        ] {
-            let font = Font {
-                features: FontFeatures(Arc::new(
-                    features
-                        .iter()
-                        .map(|(tag, value)| (tag.to_string(), *value))
-                        .collect(),
-                )),
-                ..font(family)
-            };
-            let font_id = fonts.font_id(&font).unwrap();
-            assert_eq!(
-                fonts.ascii_shaping_preserves_advances(font_id, &font.features),
-                expected,
-                "{family} {features:?}"
-            );
-            if expected {
-                let cell = layout_line(&fonts, font_id, "x").width;
-                for probe in &probes {
-                    let width = layout_line(&fonts, font_id, probe).width;
-                    assert!(
-                        (width - cell * probe.len() as f32).abs() < px(0.01),
-                        "{family} {features:?}: {width:?} for {} cells of {cell:?}",
-                        probe.len()
-                    );
-                }
-            }
-        }
-        assert!(
-            !fonts.ascii_shaping_preserves_advances(FontId(usize::MAX), &FontFeatures::default())
-        );
     }
 
     #[test]

@@ -236,6 +236,7 @@ pub struct InlayChunks<'a> {
     highlight_styles: HighlightStyles,
     highlights: Highlights<'a>,
     snapshot: &'a InlaySnapshot,
+    edit_prediction_whitespace: Option<(InlayId, bool)>,
 }
 
 #[derive(Clone)]
@@ -337,7 +338,15 @@ impl<'a> Iterator for InlayChunks<'a> {
                 let mut renderer = None;
                 let mut highlight_style = match inlay.id {
                     InlayId::EditPrediction(_) => self.highlight_styles.edit_prediction.map(|s| {
-                        if inlay.text().chars().all(|c| c.is_whitespace()) {
+                        let is_whitespace = match self.edit_prediction_whitespace {
+                            Some((id, is_whitespace)) if id == inlay.id => is_whitespace,
+                            _ => {
+                                let is_whitespace = inlay.text().chars().all(|c| c.is_whitespace());
+                                self.edit_prediction_whitespace = Some((inlay.id, is_whitespace));
+                                is_whitespace
+                            }
+                        };
+                        if is_whitespace {
                             s.whitespace
                         } else {
                             s.insertion
@@ -1134,6 +1143,24 @@ impl InlaySnapshot {
         }
     }
 
+    pub(super) fn clip_point_inside_text_inlay(
+        &self,
+        point: InlayPoint,
+        bias: Bias,
+    ) -> Option<InlayPoint> {
+        let (start, _, item) = self
+            .transforms
+            .find::<InlayPoint, _>((), &point, Bias::Right);
+        match item {
+            Some(Transform::Inlay(inlay)) if !has_chunk_renderer(inlay) => {
+                let text = inlay.text();
+                let offset = text.clip_offset(text.point_to_offset(point.0 - start.0), bias);
+                Some(InlayPoint(start.0 + text.offset_to_point(offset)))
+            }
+            _ => None,
+        }
+    }
+
     pub fn inlay_bias_at_point(&self, point: InlayPoint) -> Option<Bias> {
         let mut cursor = self.transforms.cursor::<Dimensions<InlayPoint, Point>>(());
         cursor.seek(&point, Bias::Left);
@@ -1206,7 +1233,7 @@ impl InlaySnapshot {
         summary
     }
 
-    pub fn has_inlays_matching(
+    pub(super) fn has_inlays_matching(
         &self,
         range: Range<InlayPoint>,
         mut predicate: impl FnMut(&Inlay, Range<usize>) -> bool,
@@ -1306,6 +1333,7 @@ impl InlaySnapshot {
             highlight_styles: highlights.styles,
             highlights,
             snapshot: self,
+            edit_prediction_whitespace: None,
         }
     }
 

@@ -1514,7 +1514,7 @@ pub struct Chunk<'a> {
     pub newlines: u128,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ChunkRendererId {
     Fold(FoldId),
     Inlay(InlayId),

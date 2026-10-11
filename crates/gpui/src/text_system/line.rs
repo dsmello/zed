@@ -1,7 +1,7 @@
 use crate::{
     App, Bounds, DevicePixels, Half, Hsla, LineLayout, Pixels, Point, RenderGlyphParams, Result,
-    ShapedGlyph, ShapedRun, SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window,
-    WrapBoundary, WrappedLineLayout, black, fill, point, px, size, underline_y_offset,
+    ShapedGlyph, ShapedRun, SharedString, StrikethroughStyle, TextAlign, TextRun, UnderlineStyle,
+    Window, WrapBoundary, WrappedLineLayout, black, fill, point, px, size, underline_y_offset,
 };
 use derive_more::{Deref, DerefMut};
 use smallvec::SmallVec;
@@ -101,6 +101,12 @@ impl ShapedLine {
             runs: layout.runs.clone(),
             len,
         });
+        self
+    }
+
+    /// Replaces the decorations of this line with those of `runs`, keeping its shaped glyphs.
+    pub fn with_decorations(mut self, runs: &[TextRun]) -> Self {
+        self.decoration_runs = super::decoration_runs(runs);
         self
     }
 

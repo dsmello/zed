@@ -36,6 +36,7 @@ pub struct TextLayoutDetails {
     pub vertical_scroll_margin: ScrollOffset,
     pub(crate) grid_cell: OnceCell<GridCell>,
     pub(crate) semantic_tokens_enabled: bool,
+    pub(crate) ruled_rows: bool,
 }
 
 impl TextLayoutDetails {
@@ -55,7 +56,7 @@ impl TextLayoutDetails {
             GridCell::measure(
                 &self.text_system,
                 &self.editor_style,
-                snapshot.highlight_styles(),
+                snapshot,
                 self.font_size(),
             )
         })

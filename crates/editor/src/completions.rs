@@ -20,6 +20,7 @@ impl Editor {
             vertical_scroll_margin: self.scroll_manager.vertical_scroll_margin,
             grid_cell: OnceCell::new(),
             semantic_tokens_enabled: self.semantic_token_state.enabled(),
+            ruled_rows: !self.mode.is_minimap(),
         }
     }
 
