@@ -4893,6 +4893,70 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_flush_during_restore_keeps_restored_layout(cx: &mut gpui::TestAppContext) {
+        crate::tests::init_test(cx);
+        cx.update(crate::register_serializable_item::<crate::item::test::TestItem>);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let db = cx.update(|_, cx| WorkspaceDb::global(cx));
+        let workspace_id = db.next_id().await.unwrap();
+        workspace.update(cx, |workspace, _| workspace.set_database_id(workspace_id));
+
+        let center_group = SerializedPaneGroup::Pane(SerializedPane::new(
+            vec![
+                SerializedItem::new("TestItem", 1, false, false),
+                SerializedItem::new("TestItem", 2, true, false),
+            ],
+            true,
+            0,
+        ));
+        let serialized_workspace = SerializedWorkspace {
+            id: workspace_id,
+            paths: PathList::default(),
+            identity_paths: None,
+            location: SerializedWorkspaceLocation::Local,
+            center_group: center_group.clone(),
+            window_bounds: Default::default(),
+            bookmarks: Default::default(),
+            breakpoints: Default::default(),
+            display: Default::default(),
+            docks: Default::default(),
+            centered_layout: false,
+            session_id: None,
+            window_id: None,
+            user_toolchains: Default::default(),
+            recent_navigation_history: Default::default(),
+        };
+        db.save_workspace(serialized_workspace.clone()).await;
+
+        let restore = workspace.update_in(cx, |workspace, window, cx| {
+            crate::open_items(
+                workspace,
+                Some(serialized_workspace),
+                Vec::new(),
+                window,
+                cx,
+            )
+        });
+        let flush = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.flush_serialization(window, cx)
+        });
+        drop(restore);
+        flush.await;
+
+        assert_eq!(
+            db.workspace_for_id(workspace_id)
+                .map(|workspace| workspace.center_group),
+            Some(center_group)
+        );
+    }
+
+    #[gpui::test]
     async fn test_create_workspace_serialization(cx: &mut gpui::TestAppContext) {
         crate::tests::init_test(cx);
 

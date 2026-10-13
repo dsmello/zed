@@ -7946,6 +7946,82 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_startup_new_window_open_reuses_restored_root(cx: &mut TestAppContext) {
+        for open_behavior in [
+            cli::OpenBehavior::AlwaysNew,
+            cli::OpenBehavior::PreferNewWindow,
+        ] {
+            let cx = &mut cx.new_app();
+            cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+            let app_state = init_test(cx);
+            app_state
+                .fs
+                .as_fake()
+                .insert_tree(path!("/project"), json!({ "file.txt": "content" }))
+                .await;
+            let session_id = cx.read(|cx| app_state.session.read(cx).id().to_owned());
+            let workspace::OpenResult { window, .. } = cx
+                .update(|cx| {
+                    Workspace::new_local(
+                        vec![PathBuf::from(path!("/project"))],
+                        app_state.clone(),
+                        None,
+                        None,
+                        None,
+                        workspace::OpenMode::Activate,
+                        cx,
+                    )
+                })
+                .await
+                .unwrap();
+            flush_workspace_serialization(&window, cx).await;
+            window
+                .update(cx, |_, window, _| window.remove_window())
+                .unwrap();
+            cx.run_until_parked();
+            cx.update(|cx| {
+                app_state.session.update(cx, |session, _| {
+                    session.replace_session_for_test(Session::test_with_old_session(session_id));
+                });
+            });
+
+            let (listener, requests) = OpenListener::new();
+            listener.open(RawOpenRequest {
+                urls: vec![format!("file://{}", path!("/project"))],
+                open_behavior: Some(open_behavior),
+                ..RawOpenRequest::default()
+            });
+            let startup =
+                cx.update(|cx| crate::restore_and_open_workspaces(app_state, requests, cx));
+            drop(listener);
+            startup.await;
+            cx.run_until_parked();
+
+            let root_paths = cx
+                .windows()
+                .into_iter()
+                .map(|window| {
+                    window
+                        .downcast::<MultiWorkspace>()
+                        .unwrap()
+                        .read_with(cx, |multi_workspace, cx| {
+                            multi_workspace
+                                .workspaces()
+                                .map(|workspace| workspace.read(cx).root_paths(cx))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                root_paths,
+                vec![vec![vec![Arc::from(Path::new(path!("/project")))]]],
+                "open_behavior={open_behavior:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
     async fn test_cancel_remote_restore_preserves_local_window(cx: &mut TestAppContext) {
         for open_file in [false, true] {
             let cx = &mut cx.new_app();
@@ -8055,7 +8131,7 @@ mod tests {
                 cx.update(|cx| {
                     crate::handle_open_request(
                         OpenRequest {
-                            kind: Some(OpenRequestKind::CliConnection((
+                            kind: Some(OpenRequestKind::CliConnection(CliConnection::new(
                                 request_receiver,
                                 Box::new(responses),
                             ))),

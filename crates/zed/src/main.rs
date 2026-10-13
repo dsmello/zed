@@ -934,20 +934,21 @@ fn restore_and_open_workspaces(
         )
     };
 
-    let mut startup_request = open_rx
+    let startup_request = open_rx
         .try_recv()
         .ok()
         .and_then(|request| OpenRequest::parse(request, cx).log_err());
-    let create_fallback = startup_request.as_ref().is_none_or(|request| {
-        request.open_paths.is_empty()
-            && request.diff_paths.is_empty()
-            && request.remote_connection.is_none()
-            && !matches!(request.kind, Some(OpenRequestKind::CliConnection(_)))
-    });
+    let (startup_request_tx, startup_request_rx) = oneshot::channel();
     let (local_restore_tx, local_restore_rx) = oneshot::channel();
     let restore_task = cx.spawn({
         let app_state = app_state.clone();
         async move |cx| {
+            let mut startup_request = startup_request;
+            let create_fallback = match startup_request.as_mut() {
+                Some(request) => !request.opens_window(cx).await,
+                None => true,
+            };
+            startup_request_tx.send(startup_request).ok();
             let workspaces = restorable_workspaces(cx, &app_state).await;
             if let Err(error) = restore_workspaces(
                 app_state,
@@ -993,6 +994,7 @@ fn restore_and_open_workspaces(
         let _first_window_subscription = _first_window_subscription;
         let first_window_placed = first_window_rx.shared();
         let local_restore_finished = local_restore_rx.shared();
+        let mut startup_request = startup_request_rx.await.ok().flatten();
         loop {
             let (request, restoring) = if let Some(request) = startup_request.take() {
                 (request, true)
@@ -1305,14 +1307,20 @@ fn handle_open_request(
     let dev_container = request.dev_container;
     if !request.open_paths.is_empty() || !request.diff_paths.is_empty() {
         let app_state = app_state.clone();
-        let base_open_options = zed::open_options_for_request(
+        let mut base_open_options = zed::open_options_for_request(
             request.open_behavior,
             &workspace::SerializedWorkspaceLocation::Local,
             cx,
         );
+        let restoring = restore_finished.is_some();
         task = Some(cx.spawn(async move |cx| {
             let paths_with_position =
                 derive_paths_with_position(app_state.fs.as_ref(), request.open_paths).await;
+            if restoring {
+                cx.update(|cx| {
+                    zed::reuse_restored_workspace(&mut base_open_options, &paths_with_position, cx)
+                });
+            }
             let (_window, results) = open_paths_with_positions(
                 &paths_with_position,
                 &request.diff_paths,

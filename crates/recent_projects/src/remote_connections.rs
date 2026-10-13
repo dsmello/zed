@@ -1,6 +1,6 @@
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 
 use anyhow::{Context as _, Result};
@@ -134,6 +134,7 @@ pub async fn open_remote_project(
 ) -> Result<WindowHandle<MultiWorkspace>> {
     open_remote_project_with_ready(connection_options, paths, app_state, open_options, None, cx)
         .await
+        .map(RemoteOpenOutcome::window)
 }
 
 pub fn restore_remote_project(
@@ -156,6 +157,7 @@ pub fn restore_remote_project(
             cx,
         )
         .await
+        .map(RemoteOpenOutcome::window)
     });
     (receiver, task)
 }
@@ -167,7 +169,7 @@ async fn open_remote_project_with_ready(
     mut open_options: workspace::OpenOptions,
     mut ready: Option<oneshot::Sender<WindowHandle<MultiWorkspace>>>,
     cx: &mut AsyncApp,
-) -> Result<WindowHandle<MultiWorkspace>> {
+) -> Result<RemoteOpenOutcome> {
     let (existing, _) = find_existing_workspace(
         &paths,
         &open_options,
@@ -175,7 +177,7 @@ async fn open_remote_project_with_ready(
         cx,
     )
     .await;
-    let already_connected = existing.is_some_and(|(_, workspace)| {
+    let connected_window = existing.and_then(|(window, workspace)| {
         cx.update(|cx| {
             workspace
                 .read(cx)
@@ -185,9 +187,9 @@ async fn open_remote_project_with_ready(
                 .and_then(|client| client.read(cx).remote_connection())
                 .is_some()
         })
+        .then_some(window)
     });
-    if already_connected
-        || open_options.requesting_window.is_some()
+    if open_options.requesting_window.is_some()
         || open_options.open_mode == OpenMode::NewWindow
         || open_options.workspace_matching == WorkspaceMatching::None
     {
@@ -209,9 +211,12 @@ async fn open_remote_project_with_ready(
     let register_pending = open_options.workspace_matching != WorkspaceMatching::MatchSubpaths;
     let match_subpaths = ready.is_none();
     let pending = cx.update(|cx| {
-        cx.default_global::<PendingRemoteOpens>();
+        cx.default_global::<PendingRemoteOpens>()
+            .0
+            .retain(|pending| pending.owner.strong_count() > 0);
         let matching = |pending: &&PendingRemoteOpen| {
             remote_locations_match(&pending.connection_options, &connection_options)
+                && connected_window.is_none_or(|window| pending.window == Some(window))
                 && ((register_pending && pending.paths == path_list)
                     || (match_subpaths
                         && path_list.paths().iter().any(|path| {
@@ -228,19 +233,20 @@ async fn open_remote_project_with_ready(
             .find(&matching)
             .or_else(|| pending_opens.iter().find(&matching))
             .map(|pending| (pending.clone(), pending.paths == path_list));
-        if pending.is_none() && register_pending {
+        if pending.is_none() && register_pending && connected_window.is_none() {
             cx.global_mut::<PendingRemoteOpens>()
                 .0
                 .push(PendingRemoteOpen {
                     connection_options: connection_options.clone(),
                     paths: path_list,
-                    owner: owner.clone(),
+                    owner: Arc::downgrade(&owner),
                     window: None,
                     result: receiver.shared(),
                 });
         }
         pending
     });
+
     if let Some((pending, same_paths)) = pending {
         if let Some(window) = pending.window {
             if open_options.focus != Some(false) {
@@ -252,16 +258,19 @@ async fn open_remote_project_with_ready(
                 ready.send(window).ok();
             }
         }
-        let window = pending
+        let outcome = pending
             .result
             .await
             .context("remote project open was canceled because its owner was dropped")?
             .map_err(anyhow::Error::msg)?;
         if let Some(ready) = ready {
-            ready.send(window).ok();
+            ready.send(outcome.window()).ok();
         }
-        if same_paths || window.read_with(cx, |_, _| ()).is_err() {
-            return Ok(window);
+        let RemoteOpenOutcome::Opened(window) = outcome else {
+            return Ok(outcome);
+        };
+        if same_paths {
+            return Ok(outcome);
         }
         if cx.update(|cx| cx.active_window()) != Some(window.into()) {
             open_options.focus = Some(false);
@@ -277,18 +286,19 @@ async fn open_remote_project_with_ready(
         )
         .await;
     }
+    if connected_window.is_some() {
+        return open_remote_project_inner(
+            connection_options,
+            paths,
+            app_state,
+            open_options,
+            None,
+            ready,
+            cx,
+        )
+        .await;
+    }
 
-    let _pending = util::defer({
-        let cx = cx.clone();
-        let owner = owner.clone();
-        move || {
-            cx.update(|cx| {
-                cx.default_global::<PendingRemoteOpens>()
-                    .0
-                    .retain(|pending| !Arc::ptr_eq(&pending.owner, &owner));
-            });
-        }
-    });
     let result = open_remote_project_inner(
         connection_options,
         paths,
@@ -318,7 +328,7 @@ async fn open_remote_project_inner(
     pending_owner: Option<&Arc<()>>,
     ready: Option<oneshot::Sender<WindowHandle<MultiWorkspace>>>,
     cx: &mut AsyncApp,
-) -> Result<WindowHandle<MultiWorkspace>> {
+) -> Result<RemoteOpenOutcome> {
     let created_new_window = open_options.requesting_window.is_none();
     let window_ready = |window: WindowHandle<MultiWorkspace>, cx: &mut AsyncApp| -> Result<()> {
         if open_options.focus != Some(false) {
@@ -330,7 +340,7 @@ async fn open_remote_project_inner(
                     .default_global::<PendingRemoteOpens>()
                     .0
                     .iter_mut()
-                    .find(|pending| Arc::ptr_eq(&pending.owner, owner))
+                    .find(|pending| pending.owner.as_ptr() == Arc::as_ptr(owner))
                 {
                     pending.window = Some(window);
                 }
@@ -400,7 +410,7 @@ async fn open_remote_project_inner(
                 .collect::<Vec<_>>();
             navigate_to_positions(&existing_window, items, &paths_with_positions, cx);
 
-            return Ok(existing_window);
+            return Ok(RemoteOpenOutcome::Opened(existing_window));
         }
         // If the remote connection is dead (e.g. server not running after failed reconnect),
         // fall through to establish a fresh connection instead of showing an error.
@@ -447,32 +457,19 @@ async fn open_remote_project_inner(
             let workspace = cx.new(|cx| {
                 let mut workspace = Workspace::new(None, project, app_state.clone(), window, cx);
                 workspace.centered_layout = workspace_position.centered_layout;
+                workspace.set_remote_connection_placeholder(true);
                 workspace
             });
-            cx.new(|cx| {
-                let mut multi_workspace = MultiWorkspace::new(workspace, window, cx);
-                multi_workspace.set_remote_connection_placeholder(true);
-                multi_workspace
-            })
+            cx.new(|cx| MultiWorkspace::new(workspace, window, cx))
         })?;
         let workspace = window.update(cx, |multi_workspace, _, _cx| {
             multi_workspace.workspace().clone()
         })?;
         (window, workspace)
     };
-    let _placeholder = created_new_window.then(|| {
-        let mut cx = cx.clone();
-        util::defer(move || {
-            window
-                .update(&mut cx, |multi_workspace, _, _| {
-                    multi_workspace.set_remote_connection_placeholder(false);
-                })
-                .ok();
-        })
-    });
     window_ready(window, cx)?;
 
-    loop {
+    let outcome = loop {
         let (cancel_tx, mut cancel_rx) = oneshot::channel();
         let delegate = window.update(cx, {
             let paths = paths.clone();
@@ -511,7 +508,9 @@ async fn open_remote_project_inner(
             }
         })?;
 
-        let Some(delegate) = delegate else { break };
+        let Some(delegate) = delegate else {
+            break RemoteOpenOutcome::Cancelled(window);
+        };
 
         let connection = remote::connect(connection_options.clone(), delegate.clone(), cx);
         let connection = select! {
@@ -522,7 +521,7 @@ async fn open_remote_project_inner(
                     }
                 });
 
-                break;
+                break RemoteOpenOutcome::Cancelled(window);
             },
             result = connection.fuse() => result,
         };
@@ -566,7 +565,7 @@ async fn open_remote_project_inner(
                         .update(cx, |_, window, _| window.remove_window())
                         .ok();
                 }
-                return Ok(window);
+                return Ok(RemoteOpenOutcome::Cancelled(window));
             }
         };
 
@@ -593,7 +592,7 @@ async fn open_remote_project_inner(
             }
         });
 
-        match opened {
+        break match opened {
             Err(e) => {
                 log::error!("Failed to open project: {e:#}");
                 let response = window
@@ -635,17 +634,23 @@ async fn open_remote_project_inner(
                         cx,
                     );
                 });
+                RemoteOpenOutcome::Cancelled(window)
             }
-
-            Ok((_, items)) => {
+            Ok((None, _)) => RemoteOpenOutcome::Cancelled(window),
+            Ok((Some(_), items)) => {
                 navigate_to_positions(&window, items, &paths_with_positions, cx);
+                RemoteOpenOutcome::Opened(window)
             }
-        }
+        };
+    };
 
-        break;
+    if created_new_window && matches!(outcome, RemoteOpenOutcome::Cancelled(_)) {
+        initial_workspace.update(cx, |workspace, _| {
+            workspace.set_remote_connection_placeholder(false);
+        });
     }
 
-    Ok(window)
+    Ok(outcome)
 }
 
 pub fn navigate_to_positions(
@@ -701,6 +706,20 @@ pub(crate) async fn determine_paths_with_positions(
     (paths, paths_with_positions)
 }
 
+#[derive(Clone, Copy)]
+enum RemoteOpenOutcome {
+    Opened(WindowHandle<MultiWorkspace>),
+    Cancelled(WindowHandle<MultiWorkspace>),
+}
+
+impl RemoteOpenOutcome {
+    fn window(self) -> WindowHandle<MultiWorkspace> {
+        match self {
+            Self::Opened(window) | Self::Cancelled(window) => window,
+        }
+    }
+}
+
 #[derive(Default)]
 struct PendingRemoteOpens(Vec<PendingRemoteOpen>);
 
@@ -710,9 +729,9 @@ impl Global for PendingRemoteOpens {}
 struct PendingRemoteOpen {
     connection_options: RemoteConnectionOptions,
     paths: PathList,
-    owner: Arc<()>,
+    owner: Weak<()>,
     window: Option<WindowHandle<MultiWorkspace>>,
-    result: Shared<oneshot::Receiver<Result<WindowHandle<MultiWorkspace>, String>>>,
+    result: Shared<oneshot::Receiver<Result<RemoteOpenOutcome, String>>>,
 }
 
 async fn path_exists(connection: &Arc<dyn RemoteConnection>, path: &Path) -> bool {
@@ -1028,6 +1047,42 @@ mod tests {
             "find_existing_workspace should return the workspace for the requested remote"
         );
 
+        let (unrelated_sender, unrelated_receiver) = oneshot::channel();
+        let unrelated_owner = Arc::new(());
+        cx.update(|cx| {
+            cx.default_global::<PendingRemoteOpens>()
+                .0
+                .push(PendingRemoteOpen {
+                    connection_options: opts.clone(),
+                    paths: PathList::new(&[path!("/")]),
+                    owner: Arc::downgrade(&unrelated_owner),
+                    window: None,
+                    result: unrelated_receiver.shared(),
+                });
+        });
+        let connected_open = cx.spawn({
+            let opts = opts.clone();
+            let app_state = app_state.clone();
+            async move |mut cx| {
+                open_remote_project(
+                    opts,
+                    vec![PathBuf::from(path!("/project/src/lib.rs"))],
+                    app_state,
+                    workspace::OpenOptions::default(),
+                    &mut cx,
+                )
+                .await
+            }
+        });
+        executor.run_until_parked();
+        assert_eq!(
+            connected_open.now_or_never().map(Result::unwrap),
+            Some(first_window),
+            "an unrelated pending open must not block a connected workspace"
+        );
+        drop(unrelated_owner);
+        drop(unrelated_sender);
+
         let (pending_sender, pending_receiver) = oneshot::channel();
         let pending_owner = Arc::new(());
         cx.update(|cx| {
@@ -1036,14 +1091,37 @@ mod tests {
                 .push(PendingRemoteOpen {
                     connection_options: opts.clone(),
                     paths: PathList::new(&[path!("/")]),
-                    owner: pending_owner.clone(),
+                    owner: Arc::downgrade(&pending_owner),
                     window: Some(first_window),
                     result: pending_receiver.shared(),
                 });
         });
 
-        // Second open with the same connection options should reuse the window.
         let second_paths = vec![PathBuf::from(path!("/project/src/lib.rs"))];
+        let pending_open = cx.spawn({
+            let opts = opts.clone();
+            let second_paths = second_paths.clone();
+            let app_state = app_state.clone();
+            async move |mut cx| {
+                open_remote_project(
+                    opts,
+                    second_paths,
+                    app_state,
+                    workspace::OpenOptions::default(),
+                    &mut cx,
+                )
+                .await
+            }
+        });
+        executor.run_until_parked();
+        pending_sender.send(Err("restore failed".to_owned())).ok();
+        assert_eq!(
+            pending_open.await.unwrap_err().to_string(),
+            "restore failed"
+        );
+        drop(pending_owner);
+
+        // Second open with the same connection options should reuse the window.
         open_remote_project(
             opts.clone(),
             second_paths,
@@ -1053,12 +1131,6 @@ mod tests {
         )
         .await
         .expect("second open_remote_project should succeed via reuse");
-        cx.update(|cx| {
-            cx.default_global::<PendingRemoteOpens>()
-                .0
-                .retain(|pending| !Arc::ptr_eq(&pending.owner, &pending_owner));
-        });
-        drop(pending_sender);
 
         executor.run_until_parked();
 
@@ -1094,7 +1166,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(opened.window, first_window);
+        assert_ne!(opened.window, first_window);
         opened.workspace.read_with(cx, |workspace, cx| {
             assert!(workspace.project().read(cx).is_local());
             assert_eq!(
@@ -1353,6 +1425,132 @@ mod tests {
                 });
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_cancelled_pending_remote_open_is_not_restarted(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+        cx.update(|cx| {
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+        });
+        server_cx.update(|cx| {
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+        });
+        let (opts, _server_session, _connect_guard) = RemoteClient::fake_server(cx, server_cx);
+
+        let (ready, restore) = cx.update(|cx| {
+            restore_remote_project(
+                opts.clone(),
+                vec![PathBuf::from(path!("/project"))],
+                app_state.clone(),
+                cx,
+            )
+        });
+        let window = ready.await.unwrap();
+        let file_open = cx.spawn({
+            let opts = opts.clone();
+            async move |mut cx| {
+                open_remote_project(
+                    opts,
+                    vec![PathBuf::from(path!("/project/src/main.rs"))],
+                    app_state,
+                    OpenOptions::default(),
+                    &mut cx,
+                )
+                .await
+            }
+        });
+        cx.run_until_parked();
+
+        cx.dispatch_action(window.into(), menu::Cancel);
+        cx.run_until_parked();
+
+        assert_eq!(cx.update(|cx| cx.windows().len()), 1);
+        assert_eq!(restore.await.unwrap(), window);
+        assert_eq!(file_open.await.unwrap(), window);
+    }
+
+    #[gpui::test]
+    async fn test_open_with_existing_connection_activates_window(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+        cx.update(|cx| {
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+        });
+        server_cx.update(|cx| {
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+        });
+        let (opts, server_session, connect_guard) = RemoteClient::fake_server(cx, server_cx);
+        let remote_fs = FakeFs::new(server_cx.executor());
+        remote_fs
+            .insert_tree(path!("/project"), json!({ "main.rs": "fn main() {}" }))
+            .await;
+        server_cx.update(HeadlessProject::init);
+        let languages = Arc::new(language::LanguageRegistry::new(server_cx.executor()));
+        let _headless = server_cx.new(|cx| {
+            HeadlessProject::new(
+                HeadlessAppState {
+                    session: server_session,
+                    fs: remote_fs,
+                    http_client: Arc::new(BlockedHttpClient),
+                    node_runtime: NodeRuntime::unavailable(),
+                    languages,
+                    extension_host_proxy: Arc::new(ExtensionHostProxy::new()),
+                    startup_time: std::time::Instant::now(),
+                },
+                false,
+                cx,
+            )
+        });
+        drop(connect_guard);
+        let remote_client = RemoteClient::connect_mock(opts.clone(), cx).await;
+        let project = cx.update(|cx| {
+            Project::remote(
+                remote_client,
+                app_state.client.clone(),
+                app_state.node_runtime.clone(),
+                app_state.user_store.clone(),
+                app_state.languages.clone(),
+                app_state.fs.clone(),
+                false,
+                cx,
+            )
+        });
+        let window = cx.add_window({
+            let project = project.clone();
+            let app_state = app_state.clone();
+            |window, cx| {
+                let workspace = cx.new(|cx| Workspace::new(None, project, app_state, window, cx));
+                MultiWorkspace::new(workspace, window, cx)
+            }
+        });
+        let other_window = cx.add_window(|_, _| Empty);
+        other_window
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+        assert_eq!(cx.read(|cx| cx.active_window()), Some(other_window.into()));
+
+        let mut async_cx = cx.to_async();
+        workspace::open_remote_project_with_existing_connection(
+            opts,
+            project,
+            vec![PathBuf::from(path!("/project"))],
+            app_state,
+            window,
+            None,
+            None,
+            &mut async_cx,
+        )
+        .await
+        .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(cx.read(|cx| cx.active_window()), Some(window.into()));
     }
 
     fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {

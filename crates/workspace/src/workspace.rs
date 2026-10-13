@@ -135,7 +135,7 @@ use std::{
     hash::Hash,
     path::{Path, PathBuf},
     process::ExitStatus,
-    rc::Rc,
+    rc::{self, Rc},
     sync::{
         Arc, LazyLock,
         atomic::{AtomicBool, AtomicUsize},
@@ -1654,6 +1654,14 @@ pub struct Workspace {
     persisted_recent_navigation_history: Vec<PathBuf>,
     last_active_project_path: Option<ProjectPath>,
     restoring_workspace: bool,
+    restoring_layout: Option<RestoringLayout>,
+    is_remote_connection_placeholder: bool,
+}
+
+struct RestoringLayout {
+    center_group: SerializedPaneGroup,
+    docks: DockStructure,
+    load_task_alive: rc::Weak<()>,
 }
 
 impl EventEmitter<Event> for Workspace {}
@@ -2156,6 +2164,8 @@ impl Workspace {
             persisted_recent_navigation_history: Vec::new(),
             last_active_project_path: None,
             restoring_workspace: false,
+            restoring_layout: None,
+            is_remote_connection_placeholder: false,
         }
     }
 
@@ -2374,8 +2384,8 @@ impl Workspace {
 
             let opened_items = window
                 .update(cx, |_, window, cx| {
-                    workspace.update(cx, |_workspace: &mut Workspace, cx| {
-                        open_items(serialized_workspace, project_paths, window, cx)
+                    workspace.update(cx, |workspace: &mut Workspace, cx| {
+                        open_items(workspace, serialized_workspace, project_paths, window, cx)
                     })
                 })?
                 .await
@@ -3351,6 +3361,10 @@ impl Workspace {
 
     pub fn open_in_dev_container(&self) -> bool {
         self.open_in_dev_container
+    }
+
+    pub fn set_remote_connection_placeholder(&mut self, is_placeholder: bool) {
+        self.is_remote_connection_placeholder = is_placeholder;
     }
 
     pub fn set_dev_container_task(&mut self, task: Task<Result<()>>) {
@@ -7741,8 +7755,17 @@ impl Workspace {
                     .user_toolchains(cx)
                     .unwrap_or_default();
 
-                let center_group = build_serialized_pane_group(&self.center.root, window, cx);
-                let docks = build_serialized_docks(self, window, cx);
+                let restoring_layout = self
+                    .restoring_layout
+                    .as_ref()
+                    .filter(|layout| layout.load_task_alive.strong_count() > 0);
+                let (center_group, docks) = match restoring_layout {
+                    Some(layout) => (layout.center_group.clone(), layout.docks.clone()),
+                    None => (
+                        build_serialized_pane_group(&self.center.root, window, cx),
+                        build_serialized_docks(self, window, cx),
+                    ),
+                };
                 let default_docks = (paths.is_empty()
                     && location == SerializedWorkspaceLocation::Local)
                     .then(|| docks.clone());
@@ -7865,12 +7888,20 @@ impl Workspace {
     }
 
     pub(crate) fn load_workspace(
+        &mut self,
         serialized_workspace: SerializedWorkspace,
         paths_to_open: Vec<Option<ProjectPath>>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Task<Result<Vec<Option<Box<dyn ItemHandle>>>>> {
+        let load_task_alive = Rc::new(());
+        self.restoring_layout = Some(RestoringLayout {
+            center_group: serialized_workspace.center_group.clone(),
+            docks: serialized_workspace.docks.clone(),
+            load_task_alive: Rc::downgrade(&load_task_alive),
+        });
         cx.spawn_in(window, async move |workspace, cx| {
+            let _load_task_alive = load_task_alive;
             let recent_navigation_history = serialized_workspace.recent_navigation_history.clone();
             workspace.update(cx, |workspace, _| {
                 workspace.persisted_recent_navigation_history = recent_navigation_history;
@@ -7951,6 +7982,7 @@ impl Workspace {
                 }
 
                 workspace.restoring_workspace = false;
+                workspace.restoring_layout = None;
                 cx.notify();
             })?;
 
@@ -9263,13 +9295,14 @@ fn window_bounds_env_override() -> Option<Bounds<Pixels>> {
 }
 
 fn open_items(
+    workspace: &mut Workspace,
     serialized_workspace: Option<SerializedWorkspace>,
     mut project_paths_to_open: Vec<(PathBuf, Option<ProjectPath>)>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> impl 'static + Future<Output = Result<Vec<Option<Result<Box<dyn ItemHandle>>>>>> + use<> {
     let restored_items = serialized_workspace.map(|serialized_workspace| {
-        Workspace::load_workspace(
+        workspace.load_workspace(
             serialized_workspace,
             project_paths_to_open
                 .iter()
@@ -10840,6 +10873,9 @@ fn workspace_is_at_location(
     location: &SerializedWorkspaceLocation,
     cx: &App,
 ) -> bool {
+    if workspace.read(cx).is_remote_connection_placeholder {
+        return false;
+    }
     let WorkspaceLocation::Location(workspace_location, _) =
         workspace.read(cx).workspace_location(cx)
     else {
@@ -10865,10 +10901,9 @@ pub fn workspace_windows_for_location(
         .filter_map(|window| window.downcast::<MultiWorkspace>())
         .filter(|multi_workspace| {
             multi_workspace.read(cx).is_ok_and(|multi_workspace| {
-                !multi_workspace.is_remote_connection_placeholder
-                    && multi_workspace.workspaces().any(|workspace| {
-                        workspace_is_at_location(workspace, serialized_location, cx)
-                    })
+                multi_workspace
+                    .workspaces()
+                    .any(|workspace| workspace_is_at_location(workspace, serialized_location, cx))
             })
         })
         .collect()
@@ -11125,8 +11160,8 @@ pub fn open_workspace_by_id(
         // Restore items from the serialized workspace
         window
             .update(cx, |_, window, cx| {
-                workspace.update(cx, |_workspace, cx| {
-                    open_items(Some(serialized_workspace), vec![], window, cx)
+                workspace.update(cx, |workspace, cx| {
+                    open_items(workspace, Some(serialized_workspace), vec![], window, cx)
                 })
             })?
             .await?;
@@ -11485,6 +11520,7 @@ pub fn open_remote_project_with_existing_connection(
     cx: &mut AsyncApp,
 ) -> Task<Result<(Entity<Workspace>, Vec<Option<Box<dyn ItemHandle>>>)>> {
     cx.spawn(async move |cx| {
+        window.update(cx, |_, window, _| window.activate_window())?;
         let (workspace_id, serialized_workspace) =
             deserialize_remote_project(connection_options.clone(), paths.clone(), cx).await?;
 
@@ -11593,8 +11629,14 @@ async fn open_remote_project_inner(
 
     let items = window
         .update(cx, |_, window, cx| {
-            workspace.update(cx, |_workspace, cx| {
-                open_items(serialized_workspace, project_paths_to_open, window, cx)
+            workspace.update(cx, |workspace, cx| {
+                open_items(
+                    workspace,
+                    serialized_workspace,
+                    project_paths_to_open,
+                    window,
+                    cx,
+                )
             })
         })?
         .await?;
@@ -19728,8 +19770,8 @@ mod tests {
             workspace.persisted_recent_navigation_history.clear();
         });
         workspace
-            .update_in(cx, |_, window, cx| {
-                Workspace::load_workspace(serialized_workspace, Vec::new(), window, cx)
+            .update_in(cx, |workspace, window, cx| {
+                workspace.load_workspace(serialized_workspace, Vec::new(), window, cx)
             })
             .await
             .unwrap();
